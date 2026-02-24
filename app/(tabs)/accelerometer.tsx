@@ -1,4 +1,5 @@
 import { supabase } from "@/lib/supabase";
+import * as Location from "expo-location";
 import { Accelerometer, Gyroscope } from "expo-sensors";
 import { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
@@ -6,7 +7,15 @@ import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
 const MAX_DELTA_MS = 50;
 const CHUNK_SIZE = 100;
 
-function pairReadings(accels: any[], gyros: any[]) {
+type LocationSnapshot = {
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  location_timestamp: number;
+  location_accuracy: number | null;
+};
+
+function pairReadings(accels: any[], gyros: any[], location: LocationSnapshot) {
   return accels.reduce((pairs: any[], a) => {
     const closest = gyros.reduce((best, g) =>
       Math.abs(g.timestamp - a.timestamp) <
@@ -24,6 +33,11 @@ function pairReadings(accels: any[], gyros: any[]) {
         gyro_y: closest.y,
         gyro_z: closest.z,
         gyro_timestamp: closest.timestamp,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        altitude: location.altitude,
+        location_timestamp: location.location_timestamp,
+        location_accuracy: location.location_accuracy,
       });
     }
     return pairs;
@@ -33,19 +47,27 @@ function pairReadings(accels: any[], gyros: any[]) {
 export default function App() {
   const [{ x, y, z }, setData] = useState({ x: 0, y: 0, z: 0 });
   const [{ x: gx, y: gy, z: gz }, setGyroData] = useState({ x: 0, y: 0, z: 0 });
+  const [permissionDenied, setPermissionDenied] = useState(false);
 
   const [subscription, setSubscription] = useState(null);
   const [gyroSubscription, setGyroSubscription] = useState(null);
+  const locationSubRef = useRef<Location.LocationSubscription | null>(null);
 
   const accelRef = useRef<any[]>([]);
   const gyroRef = useRef<any[]>([]);
+  const latestLocationRef = useRef<LocationSnapshot | null>(null);
 
   function maybeFlush() {
+    if (!latestLocationRef.current) return;
     if (
       accelRef.current.length > CHUNK_SIZE &&
       gyroRef.current.length > CHUNK_SIZE
     ) {
-      const pairs = pairReadings(accelRef.current, gyroRef.current);
+      const pairs = pairReadings(
+        accelRef.current,
+        gyroRef.current,
+        latestLocationRef.current,
+      );
       accelRef.current = [];
       gyroRef.current = [];
       if (pairs.length > 0) {
@@ -95,6 +117,30 @@ export default function App() {
     setGyroSubscription(null);
   };
 
+  const _subscribeLocation = async () => {
+    locationSubRef.current = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.High,
+        timeInterval: 1000,
+        distanceInterval: 0,
+      },
+      (location) => {
+        latestLocationRef.current = {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          altitude: location.coords.altitude ?? 0,
+          location_timestamp: location.timestamp,
+          location_accuracy: location.coords.accuracy ?? null,
+        };
+      },
+    );
+  };
+
+  const _unsubscribeLocation = () => {
+    locationSubRef.current?.remove();
+    locationSubRef.current = null;
+  };
+
   const _slow = () => {
     Accelerometer.setUpdateInterval(1000);
     Gyroscope.setUpdateInterval(1000);
@@ -116,19 +162,48 @@ export default function App() {
   };
 
   useEffect(() => {
-    _subscribe();
-    _subscribeGyro();
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        setPermissionDenied(true);
+        return;
+      }
+
+      await _subscribeLocation();
+      _subscribe();
+      _subscribeGyro();
+    })();
+
     return () => {
       _unsubscribe();
       _unsubscribeGyro();
-      const remaining = pairReadings(accelRef.current, gyroRef.current);
-      if (remaining.length > 0) {
-        supabase.from("data").insert(remaining);
+      _unsubscribeLocation();
+      if (latestLocationRef.current) {
+        const remaining = pairReadings(
+          accelRef.current,
+          gyroRef.current,
+          latestLocationRef.current,
+        );
+        if (remaining.length > 0) {
+          supabase.from("data").insert(remaining);
+        }
       }
       accelRef.current = [];
       gyroRef.current = [];
     };
   }, []);
+
+  if (permissionDenied) {
+    return (
+      <View style={styles.container}>
+        <Text style={styles.deniedTitle}>Location Access Required</Text>
+        <Text style={styles.deniedBody}>
+          This screen requires location permission to record data. Please enable
+          it in your device settings.
+        </Text>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -143,6 +218,18 @@ export default function App() {
       <Text style={styles.text}>x: {gx.toFixed(4)}</Text>
       <Text style={styles.text}>y: {gy.toFixed(4)}</Text>
       <Text style={styles.text}>z: {gz.toFixed(4)}</Text>
+
+      <Text style={[styles.header, styles.sectionSpacing]}>Location</Text>
+      <Text style={styles.unit}>(degrees / metres)</Text>
+      <Text style={styles.text}>
+        lat: {latestLocationRef.current?.latitude.toFixed(6) ?? "waiting..."}
+      </Text>
+      <Text style={styles.text}>
+        lng: {latestLocationRef.current?.longitude.toFixed(6) ?? "waiting..."}
+      </Text>
+      <Text style={styles.text}>
+        alt: {latestLocationRef.current?.altitude.toFixed(1) ?? "waiting..."}
+      </Text>
 
       <View style={styles.buttonContainer}>
         <TouchableOpacity onPress={_toggleAll} style={styles.button}>
@@ -184,6 +271,17 @@ const styles = StyleSheet.create({
   },
   text: {
     textAlign: "center",
+  },
+  deniedTitle: {
+    textAlign: "center",
+    fontWeight: "600",
+    fontSize: 16,
+    marginBottom: 12,
+  },
+  deniedBody: {
+    textAlign: "center",
+    color: "#666",
+    lineHeight: 22,
   },
   buttonContainer: {
     flexDirection: "row",
