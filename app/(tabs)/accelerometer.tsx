@@ -3,6 +3,33 @@ import { Accelerometer, Gyroscope } from "expo-sensors";
 import { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
 
+const MAX_DELTA_MS = 50;
+const CHUNK_SIZE = 100;
+
+function pairReadings(accels: any[], gyros: any[]) {
+  return accels.reduce((pairs: any[], a) => {
+    const closest = gyros.reduce((best, g) =>
+      Math.abs(g.timestamp - a.timestamp) <
+      Math.abs(best.timestamp - a.timestamp)
+        ? g
+        : best,
+    );
+    if (Math.abs(closest.timestamp - a.timestamp) <= MAX_DELTA_MS) {
+      pairs.push({
+        accel_x: a.x,
+        accel_y: a.y,
+        accel_z: a.z,
+        accel_timestamp: a.timestamp,
+        gyro_x: closest.x,
+        gyro_y: closest.y,
+        gyro_z: closest.z,
+        gyro_timestamp: closest.timestamp,
+      });
+    }
+    return pairs;
+  }, []);
+}
+
 export default function App() {
   const [{ x, y, z }, setData] = useState({ x: 0, y: 0, z: 0 });
   const [{ x: gx, y: gy, z: gz }, setGyroData] = useState({ x: 0, y: 0, z: 0 });
@@ -10,38 +37,36 @@ export default function App() {
   const [subscription, setSubscription] = useState(null);
   const [gyroSubscription, setGyroSubscription] = useState(null);
 
-  const dataRef = useRef<any[]>([]);
-  const gyroDataRef = useRef<any[]>([]);
-  const chunkSize = 100;
+  const accelRef = useRef<any[]>([]);
+  const gyroRef = useRef<any[]>([]);
 
-  function writeData(x: number, y: number, z: number, timestamp: number) {
-    dataRef.current.push({ x, y, z, timestamp, date: Date.now() });
-    if (dataRef.current.length > chunkSize) {
-      const batch = [...dataRef.current];
-      dataRef.current = [];
-      (async () => {
-        const { error } = await supabase.from("accel").insert(batch);
-        if (error) console.error(error);
-      })();
-    }
-  }
-
-  function writeGyroData(x: number, y: number, z: number, timestamp: number) {
-    gyroDataRef.current.push({ x, y, z, timestamp, date: Date.now() });
-    if (gyroDataRef.current.length > chunkSize) {
-      const batch = [...gyroDataRef.current];
-      gyroDataRef.current = [];
-      (async () => {
-        const { error } = await supabase.from("gyro").insert(batch);
-        if (error) console.error(error);
-      })();
+  function maybeFlush() {
+    if (
+      accelRef.current.length > CHUNK_SIZE &&
+      gyroRef.current.length > CHUNK_SIZE
+    ) {
+      const pairs = pairReadings(accelRef.current, gyroRef.current);
+      accelRef.current = [];
+      gyroRef.current = [];
+      if (pairs.length > 0) {
+        (async () => {
+          const { error } = await supabase.from("data").insert(pairs);
+          if (error) console.error(error);
+        })();
+      }
     }
   }
 
   const _subscribe = () => {
     const sub = Accelerometer.addListener((event) => {
-      writeData(event.x, event.y, event.z, event.timestamp);
+      accelRef.current.push({
+        x: event.x,
+        y: event.y,
+        z: event.z,
+        timestamp: event.timestamp,
+      });
       setData(event);
+      maybeFlush();
     });
     setSubscription(sub);
   };
@@ -53,8 +78,14 @@ export default function App() {
 
   const _subscribeGyro = () => {
     const sub = Gyroscope.addListener((event) => {
-      writeGyroData(event.x, event.y, event.z, event.timestamp);
+      gyroRef.current.push({
+        x: event.x,
+        y: event.y,
+        z: event.z,
+        timestamp: event.timestamp,
+      });
       setGyroData(event);
+      maybeFlush();
     });
     setGyroSubscription(sub);
   };
@@ -90,16 +121,12 @@ export default function App() {
     return () => {
       _unsubscribe();
       _unsubscribeGyro();
-      // Flush remaining accel data on unmount
-      if (dataRef.current.length > 0) {
-        supabase.from("accel").insert(dataRef.current);
-        dataRef.current = [];
+      const remaining = pairReadings(accelRef.current, gyroRef.current);
+      if (remaining.length > 0) {
+        supabase.from("data").insert(remaining);
       }
-      // Flush remaining gyro data on unmount
-      if (gyroDataRef.current.length > 0) {
-        supabase.from("gyro").insert(gyroDataRef.current);
-        gyroDataRef.current = [];
-      }
+      accelRef.current = [];
+      gyroRef.current = [];
     };
   }, []);
 
